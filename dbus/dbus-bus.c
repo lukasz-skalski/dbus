@@ -647,7 +647,7 @@ dbus_bus_register (DBusConnection *connection,
                    DBusError      *error)
 {
   DBusMessage *message, *reply;
-  char *name;
+  char *name = NULL;
   BusData *bd;
   dbus_bool_t retval;
 
@@ -692,6 +692,15 @@ dbus_bus_register (DBusConnection *connection,
       goto out;
     }
   
+  if(_dbus_connection_is_kdbus(connection))
+    {
+      DBusMessageIter args;
+      dbus_uint32_t registration_flags = 0;
+
+      dbus_message_iter_init_append(message, &args);
+      dbus_message_iter_append_basic(&args, DBUS_TYPE_UINT32, &registration_flags);
+    }
+
   reply = dbus_connection_send_with_reply_and_block (connection, message, -1, error);
 
   if (reply == NULL)

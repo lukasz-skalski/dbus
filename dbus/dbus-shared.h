@@ -119,6 +119,8 @@ typedef enum
 #define DBUS_START_REPLY_SUCCESS         1 /**< Service was auto started */
 #define DBUS_START_REPLY_ALREADY_RUNNING 2 /**< Service was already running */
 
+#define DBUS_ADDRESS_KDBUS "kernel:"
+
 /** @} */
 
 #ifdef __cplusplus

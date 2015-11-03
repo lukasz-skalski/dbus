@@ -111,6 +111,17 @@ DBUS_SHARED_arch_sources = 			\
 	sd-daemon.c                             \
 	sd-daemon.h
 
+DBUS_SHARED_arch_sources += \
+    dbus-transport-kdbus.c  \
+    dbus-transport-kdbus.h  \
+    kdbus-common.c          \
+    kdbus-common.h          \
+    dbus-signals.c          \
+    dbus-signals.h          \
+	dbus-marshal-gvariant.c \
+	dbus-marshal-gvariant.h \
+	dbus-protocol-gvariant.h
+
 DBUS_UTIL_arch_sources = 			\
 	dbus-sysdeps-util-unix.c		\
 	dbus-userdb-util.c			\
@@ -229,7 +240,10 @@ DBUS_SHARED_SOURCES=				\
 	$(DBUS_SHARED_arch_sources)		\
 	dbus-sysdeps.c				\
 	dbus-sysdeps.h				\
-	dbus-valgrind-internal.h
+	dbus-valgrind-internal.h    \
+	dbus-asv-util.c				\
+	dbus-asv-util.h             \
+    dbus-string-util.c
 
 ### source code that is generic utility functionality used
 ### by the bus daemon or test apps, but is NOT included
@@ -237,8 +251,6 @@ DBUS_SHARED_SOURCES=				\
 ### should be underscore-prefixed but don't really need
 ### to be unless they move to DBUS_SHARED_SOURCES later)
 DBUS_UTIL_SOURCES=				\
-	dbus-asv-util.c				\
-	dbus-asv-util.h				\
 	dbus-auth-script.c			\
 	dbus-auth-script.h			\
 	dbus-auth-util.c			\

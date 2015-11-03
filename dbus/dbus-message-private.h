@@ -83,6 +83,7 @@ struct DBusMessageLoader
   void (* unix_fds_change) (void *); /**< Notify when the pending fds change */
   void *unix_fds_change_data;
 #endif
+  uint64_t unique_sender_id;
 };
 
 
@@ -131,6 +132,8 @@ struct DBusMessage
 
   long unix_fd_counter_delta; /**< Size we incremented the unix fd counter by */
 #endif
+  DBusString *signature; /**< A placeholder for signature of received GVariant messages */
+  DBusString *unique_sender; /**< A placeholder for sender name of received GVariant messages */
 };
 
 dbus_bool_t _dbus_message_iter_get_args_valist (DBusMessageIter *iter,

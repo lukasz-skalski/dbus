@@ -2321,6 +2321,49 @@ _dbus_auth_client_new (void)
   return auth;
 }
 
+#ifdef ENABLE_KDBUS_TRANSPORT
+/**
+ * Creates a new auth conversation object for the client side of kdbus.
+ * In fact it only initialize structures and sets authenticated state
+ * because of different authentication-like mechanism in kdbus - policies
+ * TODO Probably to be checked and modified when kdbus will be documented
+ *
+ * @returns the new object or #NULL if no memory
+ */
+DBusAuth*
+_dbus_auth_client_new_kdbus (void)
+{
+  DBusAuth *auth;
+  DBusString guid_str;
+
+  if (!_dbus_string_init (&guid_str))
+    return NULL;
+
+  auth = _dbus_auth_new (sizeof (DBusAuthClient));
+  if (auth == NULL)
+    {
+      _dbus_string_free (&guid_str);
+      return NULL;
+    }
+
+  DBUS_AUTH_CLIENT (auth)->guid_from_server = guid_str;
+
+  auth->side = auth_side_client;
+  auth->state = &common_state_authenticated;
+  auth->unix_fd_negotiated = TRUE;
+
+  /* Start the auth conversation by sending AUTH for our default
+   * mechanism */
+/*  if (!send_auth (auth, &all_mechanisms[0]))
+    {
+      _dbus_auth_unref (auth);
+      return NULL;
+    }*/
+
+  return auth;
+}
+#endif
+
 /**
  * Increments the refcount of an auth object.
  *

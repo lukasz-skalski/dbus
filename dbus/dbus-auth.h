@@ -43,6 +43,9 @@ typedef enum
 
 DBusAuth*     _dbus_auth_server_new          (const DBusString       *guid);
 DBusAuth*     _dbus_auth_client_new          (void);
+#ifdef ENABLE_KDBUS_TRANSPORT
+DBusAuth* 	  _dbus_auth_client_new_kdbus 	 (void);
+#endif
 DBusAuth*     _dbus_auth_ref                 (DBusAuth               *auth);
 void          _dbus_auth_unref               (DBusAuth               *auth);
 dbus_bool_t   _dbus_auth_set_mechanisms      (DBusAuth               *auth,

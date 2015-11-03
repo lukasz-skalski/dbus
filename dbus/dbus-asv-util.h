@@ -28,19 +28,23 @@
 
 DBUS_BEGIN_DECLS
 
-DBusMessage *_dbus_asv_new_method_return (DBusMessage      *message,
-                                          DBusMessageIter  *iter,
-                                          DBusMessageIter  *arr_iter);
-dbus_bool_t  _dbus_asv_close             (DBusMessageIter *iter,
-                                          DBusMessageIter *arr_iter);
-void         _dbus_asv_abandon           (DBusMessageIter *iter,
-                                          DBusMessageIter *arr_iter);
+DBusMessage *_dbus_asv_new_method_return  (DBusMessage      *message,
+                                           DBusMessageIter  *iter,
+                                           DBusMessageIter  *arr_iter);
+dbus_bool_t  _dbus_asv_close              (DBusMessageIter *iter,
+                                           DBusMessageIter *arr_iter);
+void         _dbus_asv_abandon            (DBusMessageIter *iter,
+                                           DBusMessageIter *arr_iter);
 
-dbus_bool_t  _dbus_asv_add_uint32        (DBusMessageIter *arr_iter,
-                                          const char      *key,
-                                          dbus_uint32_t    value);
-dbus_bool_t  _dbus_asv_add_string        (DBusMessageIter *arr_iter,
-                                          const char      *key,
-                                          const char      *value);
+dbus_bool_t  _dbus_asv_add_uint32         (DBusMessageIter *arr_iter,
+                                           const char      *key,
+                                           dbus_uint32_t    value);
+dbus_bool_t  _dbus_asv_add_string         (DBusMessageIter *arr_iter,
+                                           const char      *key,
+                                           const char      *value);
 
+dbus_bool_t  _dbus_asv_add_array_of_bytes (DBusMessageIter *arr_iter,
+                                           const char      *key,
+                                           const void      *value,
+                                           unsigned int     value_len);
 #endif

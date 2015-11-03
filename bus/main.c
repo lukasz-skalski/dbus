@@ -643,6 +643,8 @@ main (int argc, char **argv)
   _dbus_set_signal_handler (SIGHUP, signal_handler);
 #endif /* DBUS_UNIX */
 
+  dbus_set_protocol_version (DBUS_MAJOR_PROTOCOL_VERSION);
+
   _dbus_verbose ("We are on D-Bus...\n");
   _dbus_loop_run (bus_context_get_loop (context));
 

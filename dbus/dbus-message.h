@@ -2,6 +2,7 @@
 /* dbus-message.h DBusMessage object
  *
  * Copyright (C) 2002, 2003, 2005 Red Hat Inc.
+ * Copyright (C) 2015  Samsung Electronics
  *
  * Licensed under the Academic Free License version 2.1
  * 
@@ -49,21 +50,31 @@ typedef struct DBusMessageIter DBusMessageIter;
  * DBusMessageIter struct; contains no public fields. 
  */
 struct DBusMessageIter
-{ 
-  void *dummy1;         /**< Don't use this */
-  void *dummy2;         /**< Don't use this */
-  dbus_uint32_t dummy3; /**< Don't use this */
-  int dummy4;           /**< Don't use this */
-  int dummy5;           /**< Don't use this */
-  int dummy6;           /**< Don't use this */
-  int dummy7;           /**< Don't use this */
-  int dummy8;           /**< Don't use this */
-  int dummy9;           /**< Don't use this */
-  int dummy10;          /**< Don't use this */
-  int dummy11;          /**< Don't use this */
-  int pad1;             /**< Don't use this */
-  int pad2;             /**< Don't use this */
-  void *pad3;           /**< Don't use this */
+{                                              /* layout on a standard 64-bit system */
+  void *dummy1;         /**< Don't use this */ /* message */
+  dbus_uint32_t dummy3; /**< Don't use this */ /* changed_stamp, iter_type, sig_refcount */
+
+                                               /* padding before union */
+                                               /* below is union */
+                                               /* reader on the left, writer on the right */
+  struct {
+    dbus_uint32_t dummy4; /**< Don't use this */ /* bitfields */         /* bitfields */
+                                                 /* padding before pointer */
+    void *dummy5;         /**< Don't use this */ /* type_str */          /* type_str */
+    int dummy6;           /**< Don't use this */ /* type_pos */          /* type_pos */
+                                                 /* padding before pointer */
+    void *dummy7;         /**< Don't use this */ /* value_str */         /* value_str */
+    int dummy8;           /**< Don't use this */ /* value_pos */         /* value_pos */
+    int dummy9;           /**< Don't use this */ /* variable_index */    /* padding */
+    size_t dummy10;       /**< Don't use this */ /* value_start */       /* value_start */
+    size_t dummy11;       /**< Don't use this */ /* value_end */         /* u.array.start_pos */
+                                                                         /* u.array.len_pos */
+    int dummy12;          /**< Don't use this */ /* n_offsets */    /* u.array.element_type_pos*/
+    void *dummy13;        /**< Don't use this */ /* klass */        /* u.array.offsets_size */
+    struct {
+      int dummy14;          /**< Don't use this */ /* u.array.start_pos */
+    } dummy_u;
+  } dummy_u;
 };
 
 DBUS_EXPORT
@@ -301,6 +312,9 @@ DBusMessage* dbus_message_demarshal (const char *str,
 DBUS_EXPORT
 int          dbus_message_demarshal_bytes_needed (const char *str, 
                                                   int len);
+
+DBUS_EXPORT
+void         dbus_set_protocol_version (unsigned char version);
 
 /** @} */
 

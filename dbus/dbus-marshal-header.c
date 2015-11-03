@@ -27,6 +27,9 @@
 #include "dbus-marshal-recursive.h"
 #include "dbus-marshal-byteswap.h"
 
+#include "dbus-protocol-gvariant.h"
+#include "dbus-marshal-gvariant.h"
+
 /**
  * @addtogroup DBusMarshal
  *
@@ -122,6 +125,12 @@ correct_header_padding (DBusHeader *header)
 /** Compute the end of the header, ignoring padding */
 #define HEADER_END_BEFORE_PADDING(header) \
   (_dbus_string_get_length (&(header)->data) - (header)->padding)
+
+static dbus_bool_t
+_dbus_header_is_gvariant (const DBusHeader *header)
+{
+  return (header->protocol_version == DBUS_PROTOCOL_VERSION_GVARIANT);
+}
 
 /**
  * Invalidates all fields in the cache. This may be used when the
@@ -415,6 +424,11 @@ _dbus_header_set_serial (DBusHeader    *header,
                             SERIAL_OFFSET,
 			    serial,
                             _dbus_header_get_byte_order (header));
+  if (_dbus_header_is_gvariant (header))
+    _dbus_marshal_set_uint32 (&header->data,
+                              SERIAL_OFFSET+4,
+                              0,
+                              _dbus_header_get_byte_order (header));
 }
 
 /**
@@ -513,6 +527,7 @@ _dbus_header_copy (const DBusHeader *header,
  * for use. #NULL may be specified for some or all of the fields to
  * avoid adding those fields. Some combinations of fields don't make
  * sense, and passing them in will trigger an assertion failure.
+ * This is used only for dbus1 messages. GVariant uses _dbus_header_gvariant_create.
  *
  * @param header the header
  * @param byte_order byte order of the header
@@ -678,12 +693,15 @@ _dbus_header_have_message_untrusted (int                max_message_length,
                                      int               *body_len,
                                      const DBusString  *str,
                                      int                start,
-                                     int                len)
+                                     int                len,
+                                     dbus_bool_t       *is_gvariant)
 
 {
   dbus_uint32_t header_len_unsigned;
   dbus_uint32_t fields_array_len_unsigned;
   dbus_uint32_t body_len_unsigned;
+
+  dbus_uint32_t protocol_version;
 
   _dbus_assert (start >= 0);
   _dbus_assert (start < _DBUS_INT32_MAX / 2);
@@ -699,19 +717,38 @@ _dbus_header_have_message_untrusted (int                max_message_length,
       return FALSE;
     }
 
-  _dbus_assert (FIELDS_ARRAY_LENGTH_OFFSET + 4 <= len);
-  fields_array_len_unsigned = _dbus_marshal_read_uint32 (str, start + FIELDS_ARRAY_LENGTH_OFFSET,
-                                                         *byte_order, NULL);
+  protocol_version = _dbus_string_get_byte (str, start + VERSION_OFFSET);
+  if (DBUS_MAJOR_PROTOCOL_VERSION == protocol_version)
+    {
+      _dbus_assert (FIELDS_ARRAY_LENGTH_OFFSET + 4 <= len);
+      fields_array_len_unsigned = _dbus_marshal_read_uint32 (str, start + FIELDS_ARRAY_LENGTH_OFFSET,
+          *byte_order, NULL);
+
+      _dbus_assert (BODY_LENGTH_OFFSET + 4 < len);
+      body_len_unsigned = _dbus_marshal_read_uint32 (str, start + BODY_LENGTH_OFFSET,
+          *byte_order, NULL);
+
+      *is_gvariant = FALSE;
+    }
+  else if (DBUS_PROTOCOL_VERSION_GVARIANT == protocol_version)
+    {
+      if (!_dbus_gvariant_raw_get_lengths (str, &fields_array_len_unsigned, &body_len_unsigned, validity))
+      {
+        return FALSE;
+      }
+      *is_gvariant = TRUE;
+    }
+  else
+    {
+      *validity = DBUS_INVALID_BAD_PROTOCOL_VERSION;
+      return FALSE;
+    }
 
   if (fields_array_len_unsigned > (unsigned) max_message_length)
     {
       *validity = DBUS_INVALID_INSANE_FIELDS_ARRAY_LENGTH;
       return FALSE;
     }
-
-  _dbus_assert (BODY_LENGTH_OFFSET + 4 < len);
-  body_len_unsigned = _dbus_marshal_read_uint32 (str, start + BODY_LENGTH_OFFSET,
-                                                 *byte_order, NULL);
 
   if (body_len_unsigned > (unsigned) max_message_length)
     {
@@ -940,6 +977,86 @@ load_and_validate_field (DBusHeader     *header,
   return DBUS_VALID;
 }
 
+static dbus_bool_t
+_dbus_header_load_dbus1 (DBusHeader     *header,
+                         DBusTypeReader *reader,
+                         DBusValidity   *validity,
+                         int             body_len)
+{
+  dbus_uint32_t v_uint32;
+  dbus_uint32_t serial;
+  DBusTypeReader array_reader;
+
+  /* BODY LENGTH */
+  _dbus_assert (_dbus_type_reader_get_current_type (reader) == DBUS_TYPE_UINT32);
+  _dbus_assert (_dbus_type_reader_get_value_pos (reader) == BODY_LENGTH_OFFSET);
+  _dbus_type_reader_read_basic (reader, &v_uint32);
+  _dbus_type_reader_next (reader);
+
+  _dbus_assert (body_len == (signed) v_uint32);
+
+  /* SERIAL */
+  _dbus_assert (_dbus_type_reader_get_current_type (reader) == DBUS_TYPE_UINT32);
+  _dbus_assert (_dbus_type_reader_get_value_pos (reader) == SERIAL_OFFSET);
+  _dbus_type_reader_read_basic (reader, &serial);
+  _dbus_type_reader_next (reader);
+
+  if (serial == 0)
+    {
+      *validity = DBUS_INVALID_BAD_SERIAL;
+      return FALSE;
+    }
+
+  _dbus_assert (_dbus_type_reader_get_current_type (reader) == DBUS_TYPE_ARRAY);
+  _dbus_assert (_dbus_type_reader_get_value_pos (reader) == FIELDS_ARRAY_LENGTH_OFFSET);
+
+  _dbus_type_reader_recurse (reader, &array_reader);
+  while (_dbus_type_reader_get_current_type (&array_reader) != DBUS_TYPE_INVALID)
+    {
+      DBusTypeReader struct_reader;
+      DBusTypeReader variant_reader;
+      unsigned char field_code;
+      DBusValidity v;
+
+      _dbus_assert (_dbus_type_reader_get_current_type (&array_reader) == DBUS_TYPE_STRUCT);
+
+      _dbus_type_reader_recurse (&array_reader, &struct_reader);
+
+      _dbus_assert (_dbus_type_reader_get_current_type (&struct_reader) == DBUS_TYPE_BYTE);
+      _dbus_type_reader_read_basic (&struct_reader, &field_code);
+      _dbus_type_reader_next (&struct_reader);
+
+      if (field_code == DBUS_HEADER_FIELD_INVALID)
+        {
+          _dbus_verbose ("invalid header field code\n");
+          *validity = DBUS_INVALID_HEADER_FIELD_CODE;
+          return FALSE;
+        }
+
+      if (field_code > DBUS_HEADER_FIELD_LAST)
+        {
+          _dbus_verbose ("unknown header field code %d, skipping\n",
+                         field_code);
+          goto next_field;
+        }
+
+      _dbus_assert (_dbus_type_reader_get_current_type (&struct_reader) == DBUS_TYPE_VARIANT);
+      _dbus_type_reader_recurse (&struct_reader, &variant_reader);
+
+      v = load_and_validate_field (header, field_code, &variant_reader);
+      if (v != DBUS_VALID)
+        {
+          _dbus_verbose ("Field %d was invalid\n", field_code);
+          *validity = v;
+          return FALSE;
+        }
+
+    next_field:
+      _dbus_type_reader_next (&array_reader);
+    }
+  return TRUE;
+}
+
 /**
  * Creates a message header from potentially-untrusted data. The
  * return value is #TRUE if there was enough memory and the data was
@@ -981,13 +1098,11 @@ _dbus_header_load (DBusHeader        *header,
   int leftover;
   DBusValidity v;
   DBusTypeReader reader;
-  DBusTypeReader array_reader;
   unsigned char v_byte;
-  dbus_uint32_t v_uint32;
-  dbus_uint32_t serial;
   int padding_start;
   int padding_len;
   int i;
+  const DBusString *signature;
 
   _dbus_assert (start == (int) _DBUS_ALIGN_VALUE (start, 8));
   _dbus_assert (header_len <= len);
@@ -999,6 +1114,14 @@ _dbus_header_load (DBusHeader        *header,
       *validity = DBUS_VALIDITY_UNKNOWN_OOM_ERROR;
       return FALSE;
     }
+  if (_dbus_header_is_gvariant (header))
+    {
+      signature = _dbus_get_gvariant_header_signature_str();
+    }
+  else
+    {
+      signature = &_dbus_header_signature_str;
+    }
 
   if (mode == DBUS_VALIDATION_MODE_WE_TRUST_THIS_DATA_ABSOLUTELY)
     {
@@ -1006,10 +1129,20 @@ _dbus_header_load (DBusHeader        *header,
     }
   else
     {
-      v = _dbus_validate_body_with_reason (&_dbus_header_signature_str, 0,
-                                           byte_order,
-                                           &leftover,
-                                           str, start, len);
+      if (!_dbus_header_is_gvariant (header))
+        {
+          v = _dbus_validate_body_with_reason (signature, 0,
+                                               byte_order,
+                                               &leftover,
+                                               str, start, len);
+        }
+      else
+        {
+          v = _dbus_validate_gvariant_body_with_reason (signature, 0,
+                                               byte_order,
+                                               &leftover,
+                                               str, start, len);
+        }
       
       if (v != DBUS_VALID)
         {
@@ -1048,7 +1181,7 @@ _dbus_header_load (DBusHeader        *header,
 
   _dbus_type_reader_init (&reader,
                           byte_order,
-                          &_dbus_header_signature_str, 0,
+                          signature, 0,
                           str, start);
 
   /* BYTE ORDER */
@@ -1090,75 +1223,25 @@ _dbus_header_load (DBusHeader        *header,
 
   if (v_byte != DBUS_MAJOR_PROTOCOL_VERSION)
     {
-      *validity = DBUS_INVALID_BAD_PROTOCOL_VERSION;
-      goto invalid;
+      if (v_byte == DBUS_PROTOCOL_VERSION_GVARIANT)
+      {
+        reader.gvariant = TRUE;
+      }
+      else
+      {
+        *validity = DBUS_INVALID_BAD_PROTOCOL_VERSION;
+        goto invalid;
+      }
     }
-
-  /* BODY LENGTH */
-  _dbus_assert (_dbus_type_reader_get_current_type (&reader) == DBUS_TYPE_UINT32);
-  _dbus_assert (_dbus_type_reader_get_value_pos (&reader) == BODY_LENGTH_OFFSET);
-  _dbus_type_reader_read_basic (&reader, &v_uint32);
-  _dbus_type_reader_next (&reader);
-
-  _dbus_assert (body_len == (signed) v_uint32);
-
-  /* SERIAL */
-  _dbus_assert (_dbus_type_reader_get_current_type (&reader) == DBUS_TYPE_UINT32);
-  _dbus_assert (_dbus_type_reader_get_value_pos (&reader) == SERIAL_OFFSET);
-  _dbus_type_reader_read_basic (&reader, &serial);
-  _dbus_type_reader_next (&reader);
-
-  if (serial == 0)
+  if (reader.gvariant)
     {
-      *validity = DBUS_INVALID_BAD_SERIAL;
-      goto invalid;
+      if (!_dbus_header_load_gvariant (header, &reader, validity))
+        goto invalid;
     }
-
-  _dbus_assert (_dbus_type_reader_get_current_type (&reader) == DBUS_TYPE_ARRAY);
-  _dbus_assert (_dbus_type_reader_get_value_pos (&reader) == FIELDS_ARRAY_LENGTH_OFFSET);
-
-  _dbus_type_reader_recurse (&reader, &array_reader);
-  while (_dbus_type_reader_get_current_type (&array_reader) != DBUS_TYPE_INVALID)
+  else
     {
-      DBusTypeReader struct_reader;
-      DBusTypeReader variant_reader;
-      unsigned char field_code;
-
-      _dbus_assert (_dbus_type_reader_get_current_type (&array_reader) == DBUS_TYPE_STRUCT);
-
-      _dbus_type_reader_recurse (&array_reader, &struct_reader);
-
-      _dbus_assert (_dbus_type_reader_get_current_type (&struct_reader) == DBUS_TYPE_BYTE);
-      _dbus_type_reader_read_basic (&struct_reader, &field_code);
-      _dbus_type_reader_next (&struct_reader);
-
-      if (field_code == DBUS_HEADER_FIELD_INVALID)
-        {
-          _dbus_verbose ("invalid header field code\n");
-          *validity = DBUS_INVALID_HEADER_FIELD_CODE;
-          goto invalid;
-        }
-
-      if (field_code > DBUS_HEADER_FIELD_LAST)
-        {
-          _dbus_verbose ("unknown header field code %d, skipping\n",
-                         field_code);
-          goto next_field;
-        }
-
-      _dbus_assert (_dbus_type_reader_get_current_type (&struct_reader) == DBUS_TYPE_VARIANT);
-      _dbus_type_reader_recurse (&struct_reader, &variant_reader);
-
-      v = load_and_validate_field (header, field_code, &variant_reader);
-      if (v != DBUS_VALID)
-        {
-          _dbus_verbose ("Field %d was invalid\n", field_code);
-          *validity = v;
-          goto invalid;
-        }
-
-    next_field:
-      _dbus_type_reader_next (&array_reader);
+      if (!_dbus_header_load_dbus1 (header, &reader, validity, body_len))
+        goto invalid;
     }
 
   /* Anything we didn't fill in is now known not to exist */
@@ -1258,19 +1341,8 @@ find_field_for_modification (DBusHeader     *header,
   return retval;
 }
 
-/**
- * Sets the value of a field with basic type. If the value is a string
- * value, it isn't allowed to be #NULL. If the field doesn't exist,
- * it will be created.
- *
- * @param header the header
- * @param field the field to set
- * @param type the type of the value
- * @param value the value as for _dbus_marshal_set_basic()
- * @returns #FALSE if no memory
- */
-dbus_bool_t
-_dbus_header_set_field_basic (DBusHeader       *header,
+static dbus_bool_t
+_dbus_header_set_field_basic_dbus1 (DBusHeader       *header,
                               int               field,
                               int               type,
                               const void       *value)
@@ -1338,17 +1410,29 @@ _dbus_header_set_field_basic (DBusHeader       *header,
 }
 
 /**
- * Gets the value of a field with basic type. If the field
- * doesn't exist, returns #FALSE, otherwise returns #TRUE.
+ * Sets the value of a field with basic type. If the value is a string
+ * value, it isn't allowed to be #NULL. If the field doesn't exist,
+ * it will be created.
  *
  * @param header the header
- * @param field the field to get
+ * @param field the field to set
  * @param type the type of the value
- * @param value the value as for _dbus_marshal_read_basic()
- * @returns #FALSE if the field doesn't exist
+ * @param value the value as for _dbus_marshal_set_basic()
+ * @returns #FALSE if no memory
  */
 dbus_bool_t
-_dbus_header_get_field_basic (DBusHeader    *header,
+_dbus_header_set_field_basic (DBusHeader       *header,
+                              int               field,
+                              int               type,
+                              const void       *value)
+{
+  return _dbus_header_is_gvariant (header) ?
+                _dbus_header_set_field_basic_gvariant (header, field, type, value) :
+                _dbus_header_set_field_basic_dbus1 (header, field, type, value);
+}
+
+static dbus_bool_t
+_dbus_header_get_field_basic_dbus1 (DBusHeader    *header,
                               int            field,
                               int            type,
                               void          *value)
@@ -1373,6 +1457,26 @@ _dbus_header_get_field_basic (DBusHeader    *header,
                             NULL);
 
   return TRUE;
+}
+/**
+ * Gets the value of a field with basic type. If the field
+ * doesn't exist, returns #FALSE, otherwise returns #TRUE.
+ *
+ * @param header the header
+ * @param field the field to get
+ * @param type the type of the value
+ * @param value the value as for _dbus_marshal_read_basic()
+ * @returns #FALSE if the field doesn't exist
+ */
+dbus_bool_t
+_dbus_header_get_field_basic (DBusHeader    *header,
+                              int            field,
+                              int            type,
+                              void          *value)
+{
+  return _dbus_header_is_gvariant (header) ?
+                _dbus_header_get_field_basic_gvariant (header, field, type, value) :
+                _dbus_header_get_field_basic_dbus1 (header, field, type, value);
 }
 
 /**

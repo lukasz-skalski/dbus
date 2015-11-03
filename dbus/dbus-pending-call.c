@@ -418,6 +418,11 @@ _dbus_pending_call_last_unref (DBusPendingCall *pending)
   /* this assumes we aren't holding connection lock... */
   _dbus_data_slot_list_free (&pending->slot_list);
 
+  /*
+   * For prevent connection free at the _dbus_timeout_list_remove_timeout (SWC)
+   */
+  CONNECTION_LOCK(connection);
+
   if (pending->timeout != NULL)
     _dbus_timeout_unref (pending->timeout);
       
@@ -437,6 +442,11 @@ _dbus_pending_call_last_unref (DBusPendingCall *pending)
   dbus_free (pending);
 
   dbus_pending_call_free_data_slot (&notify_user_data_slot);
+
+  /*
+   * For prevent connection free at the _dbus_timeout_list_remove_timeout (SWC)
+   */
+  CONNECTION_UNLOCK(connection);
 
   /* connection lock should not be held. */
   /* Free the connection last to avoid a weird state while

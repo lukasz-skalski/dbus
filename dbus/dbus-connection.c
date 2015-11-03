@@ -36,6 +36,7 @@
 #include "dbus-message-private.h"
 #include "dbus-threads.h"
 #include "dbus-protocol.h"
+#include "dbus-protocol-gvariant.h"
 #include "dbus-dataslot.h"
 #include "dbus-string.h"
 #include "dbus-signature.h"
@@ -44,6 +45,7 @@
 #include "dbus-threads-internal.h"
 #include "dbus-bus.h"
 #include "dbus-marshal-basic.h"
+#include "kdbus-common.h"
 
 #ifdef DBUS_DISABLE_CHECKS
 #define TOOK_LOCK_CHECK(connection)
@@ -533,6 +535,52 @@ _dbus_connection_queue_received_message_link (DBusConnection  *connection,
       "_dbus_conection_queue_received_message_link");
 }
 
+static dbus_bool_t
+_dbus_connection_assure_protocol_version (DBusConnection   *connection,
+                                          DBusMessage      **message)
+{
+  DBusMessage *msg = *message;
+  dbus_bool_t conversion_needed = FALSE;
+  dbus_bool_t convert_to_gvariant = FALSE;
+  dbus_bool_t send_to_kdbus = _dbus_connection_is_kdbus (connection);
+
+  if (send_to_kdbus && msg->header.protocol_version != DBUS_PROTOCOL_VERSION_GVARIANT)
+    {
+      conversion_needed = TRUE;
+      convert_to_gvariant = TRUE;
+    }
+  else if (!send_to_kdbus && msg->header.protocol_version == DBUS_PROTOCOL_VERSION_GVARIANT)
+    {
+      conversion_needed = TRUE;
+      convert_to_gvariant = FALSE;
+    }
+
+  if (conversion_needed)
+    {
+      msg = _dbus_message_remarshal (msg, convert_to_gvariant);
+#if defined(DBUS_ENABLE_CHECKS)
+      {
+        DBusMessage *converted_again = _dbus_message_remarshal (*message, convert_to_gvariant);
+        DBusMessage *converted_back;
+        dbus_message_lock (converted_again);
+        converted_back = _dbus_message_remarshal (converted_again, !convert_to_gvariant);
+        dbus_message_lock (converted_back);
+
+        if (!_dbus_string_equal (&(*message)->body, &converted_back->body))
+          {
+            _dbus_abort();
+          }
+        dbus_message_unref (converted_again);
+        dbus_message_unref (converted_back);
+      }
+#endif
+    }
+
+  *message = msg;
+
+  return *message != NULL;
+}
+
 /**
  * Adds a link + message to the incoming message queue.
  * Can't fail. Takes ownership of both link and message.
@@ -545,8 +593,20 @@ void
 _dbus_connection_queue_synthesized_message_link (DBusConnection *connection,
 						 DBusList *link)
 {
+  DBusMessage *msg, *rmsg;
+
   HAVE_LOCK_CHECK (connection);
-  
+
+  msg = (DBusMessage *)link->data;
+
+  rmsg = msg;
+  _dbus_connection_assure_protocol_version (connection, &rmsg);
+
+  if (rmsg != msg) {
+    _dbus_list_free_link(link);
+    link = _dbus_list_alloc_link (rmsg);
+  }
+
   _dbus_list_append_link (&connection->incoming_messages, link);
 
   connection->n_incoming += 1;
@@ -1998,6 +2058,28 @@ _dbus_connection_send_preallocated_unlocked_no_update (DBusConnection       *con
 {
   dbus_uint32_t serial;
 
+  /* Finish preparing the message */
+  if (dbus_message_get_serial (message) == 0)
+    {
+      serial = _dbus_connection_get_next_client_serial (connection);
+      dbus_message_set_serial (message, serial);
+      if (client_serial)
+        *client_serial = serial;
+    }
+  else
+    {
+      if (client_serial)
+        *client_serial = dbus_message_get_serial (message);
+    }
+
+  _dbus_verbose ("Message %p serial is %u\n",
+                 message, dbus_message_get_serial (message));
+
+  dbus_message_lock (message);
+
+  /* This convert message if neccessary */
+  _dbus_connection_assure_protocol_version (connection, &message);
+
   preallocated->queue_link->data = message;
   _dbus_list_prepend_link (&connection->outgoing_messages,
                            preallocated->queue_link);
@@ -2032,24 +2114,6 @@ _dbus_connection_send_preallocated_unlocked_no_update (DBusConnection       *con
                  "null",
                  connection,
                  connection->n_outgoing);
-
-  if (dbus_message_get_serial (message) == 0)
-    {
-      serial = _dbus_connection_get_next_client_serial (connection);
-      dbus_message_set_serial (message, serial);
-      if (client_serial)
-        *client_serial = serial;
-    }
-  else
-    {
-      if (client_serial)
-        *client_serial = dbus_message_get_serial (message);
-    }
-
-  _dbus_verbose ("Message %p serial is %u\n",
-                 message, dbus_message_get_serial (message));
-  
-  dbus_message_lock (message);
 
   /* Now we need to run an iteration to hopefully just write the messages
    * out immediately, and otherwise get them queued up
@@ -2180,52 +2244,6 @@ _dbus_memory_pause_based_on_timeout (int timeout_milliseconds)
     _dbus_sleep_milliseconds (timeout_milliseconds / 3);
   else
     _dbus_sleep_milliseconds (1000);
-}
-
-static DBusMessage *
-generate_local_error_message (dbus_uint32_t serial, 
-                              char *error_name, 
-                              char *error_msg)
-{
-  DBusMessage *message;
-  message = dbus_message_new (DBUS_MESSAGE_TYPE_ERROR);
-  if (!message)
-    goto out;
-
-  if (!dbus_message_set_error_name (message, error_name))
-    {
-      dbus_message_unref (message);
-      message = NULL;
-      goto out; 
-    }
-
-  dbus_message_set_no_reply (message, TRUE); 
-
-  if (!dbus_message_set_reply_serial (message,
-                                      serial))
-    {
-      dbus_message_unref (message);
-      message = NULL;
-      goto out;
-    }
-
-  if (error_msg != NULL)
-    {
-      DBusMessageIter iter;
-
-      dbus_message_iter_init_append (message, &iter);
-      if (!dbus_message_iter_append_basic (&iter,
-                                           DBUS_TYPE_STRING,
-                                           &error_msg))
-        {
-          dbus_message_unref (message);
-          message = NULL;
-	  goto out;
-        }
-    }
-
- out:
-  return message;
 }
 
 /*
@@ -2470,9 +2488,9 @@ _dbus_connection_block_pending_call (DBusPendingCall *pending)
     {
       DBusMessage *error_msg;
 
-      error_msg = generate_local_error_message (client_serial,
-                                                DBUS_ERROR_DISCONNECTED, 
-                                                "Connection was disconnected before a reply was received"); 
+      error_msg = _dbus_generate_local_error_message (client_serial,
+                                                      DBUS_ERROR_DISCONNECTED,
+                                                      "Connection was disconnected before a reply was received");
 
       /* on OOM error_msg is set to NULL */
       complete_pending_call_and_unlock (connection, pending, error_msg);
@@ -3004,6 +3022,21 @@ dbus_connection_get_is_authenticated (DBusConnection *connection)
   
   return res;
 }
+
+dbus_bool_t
+_dbus_connection_is_kdbus (DBusConnection *connection)
+{
+  const char *address = _dbus_transport_get_address (connection->transport);
+
+  if (NULL == connection)
+    return FALSE;
+
+  if(address != NULL && !strncmp(address, DBUS_ADDRESS_KDBUS, 7))
+    return TRUE;
+
+  return FALSE;
+}
+
 
 /**
  * Gets whether the connection is not authenticated as a specific
@@ -5163,6 +5196,16 @@ dbus_connection_get_socket(DBusConnection              *connection,
   return retval;
 }
 
+/**
+ *
+ * Getter for number of messages in incoming queue.
+ * Useful for sending reply to self (see kdbus_do_iteration)
+ */
+int
+_dbus_connection_get_n_incoming (DBusConnection *connection)
+{
+  return connection->n_incoming;
+}
 
 /**
  * Gets the UNIX user ID of the connection if known.  Returns #TRUE if
@@ -5190,18 +5233,33 @@ dbus_bool_t
 dbus_connection_get_unix_user (DBusConnection *connection,
                                unsigned long  *uid)
 {
-  dbus_bool_t result;
+  dbus_bool_t result = FALSE;
 
   _dbus_return_val_if_fail (connection != NULL, FALSE);
   _dbus_return_val_if_fail (uid != NULL, FALSE);
 
   CONNECTION_LOCK (connection);
 
-  if (!_dbus_transport_try_to_authenticate (connection->transport))
-    result = FALSE;
+  if (_dbus_connection_is_kdbus (connection))
+    {
+      const char *unique_name = dbus_bus_get_unique_name (connection);
+      if (unique_name != NULL)
+        result = kdbus_connection_get_unix_user (connection->transport,
+                                                 unique_name, uid, NULL);
+      else
+        {
+          _dbus_verbose("Unable to get bus unique name");
+          result = FALSE;
+        }
+    }
   else
-    result = _dbus_transport_get_unix_user (connection->transport,
-                                            uid);
+    {
+      if (!_dbus_transport_try_to_authenticate (connection->transport))
+        result = FALSE;
+      else
+        result = _dbus_transport_get_unix_user (connection->transport,
+                                                uid);
+    }
 
 #ifdef DBUS_WIN
   _dbus_assert (!result);
@@ -5226,18 +5284,33 @@ dbus_bool_t
 dbus_connection_get_unix_process_id (DBusConnection *connection,
 				     unsigned long  *pid)
 {
-  dbus_bool_t result;
+  dbus_bool_t result = FALSE;
 
   _dbus_return_val_if_fail (connection != NULL, FALSE);
   _dbus_return_val_if_fail (pid != NULL, FALSE);
 
   CONNECTION_LOCK (connection);
 
-  if (!_dbus_transport_try_to_authenticate (connection->transport))
-    result = FALSE;
+  if (_dbus_connection_is_kdbus (connection))
+    {
+      const char *unique_name = dbus_bus_get_unique_name (connection);
+      if (unique_name != NULL)
+        result = kdbus_connection_get_unix_process_id (connection->transport,
+                                                       unique_name, pid, NULL);
+      else
+        {
+          _dbus_verbose("Unable to get bus unique name.");
+          result = FALSE;
+        }
+    }
   else
-    result = _dbus_transport_get_unix_process_id (connection->transport,
-						  pid);
+    {
+      if (!_dbus_transport_try_to_authenticate (connection->transport))
+        result = FALSE;
+      else
+        result = _dbus_transport_get_unix_process_id (connection->transport,
+                                                      pid);
+    }
 
   CONNECTION_UNLOCK (connection);
 

@@ -2,6 +2,7 @@
 /* dbus-marshal-recursive.c  Marshalling routines for recursive types
  *
  * Copyright (C) 2004, 2005 Red Hat, Inc.
+ * Copyright (C) 2015  Samsung Electronics
  *
  * Licensed under the Academic Free License version 2.1
  *
@@ -26,6 +27,7 @@
 #include "dbus-marshal-basic.h"
 #include "dbus-signature.h"
 #include "dbus-internals.h"
+#include "dbus-marshal-gvariant.h"
 
 /**
  * @addtogroup DBusMarshal
@@ -147,7 +149,8 @@ reader_init (DBusTypeReader    *reader,
              const DBusString  *type_str,
              int                type_pos,
              const DBusString  *value_str,
-             int                value_pos)
+             int                value_pos,
+             dbus_bool_t        gvariant)
 {
   reader->byte_order = byte_order;
   reader->finished = FALSE;
@@ -155,6 +158,11 @@ reader_init (DBusTypeReader    *reader,
   reader->type_pos = type_pos;
   reader->value_str = value_str;
   reader->value_pos = value_pos;
+  reader->value_start = value_pos;
+  reader->gvariant = gvariant;
+  reader->variable_index = 0;
+  reader->offsets_from_back = TRUE;
+  reader->is_variant = FALSE;
 }
 
 static void
@@ -167,7 +175,8 @@ base_reader_recurse (DBusTypeReader *sub,
                parent->type_str,
                parent->type_pos,
                parent->value_str,
-               parent->value_pos);
+               parent->value_pos,
+               parent->gvariant);
 }
 
 static void
@@ -190,8 +199,31 @@ struct_or_dict_entry_reader_recurse (DBusTypeReader *sub,
 {
   struct_or_dict_entry_types_only_reader_recurse (sub, parent);
 
-  /* struct and dict entry have 8 byte alignment */
-  sub->value_pos = _DBUS_ALIGN_VALUE (sub->value_pos, 8);
+  if (sub->gvariant)
+  {
+    /* GVARIANT */
+    /* check if current type is fixed or variable */
+    int alignment = 1;
+    int size = _dbus_reader_get_type_fixed_size (parent, &alignment);
+    sub->value_pos = _DBUS_ALIGN_VALUE (sub->value_pos, alignment); /* adjust alignment */
+    sub->value_start = sub->value_pos;
+    sub->n_offsets = _dbus_reader_count_offsets (sub);
+    sub->offsets_from_back = TRUE;
+
+    if (0 == size)
+    {
+      sub->value_end = _dbus_reader_get_offset_of_end_of_variable (parent);
+    }
+    else
+    {
+      sub->value_end = sub->value_pos + size;
+    }
+  }
+  else
+  {
+    /* struct and dict entry have 8 byte alignment */
+    sub->value_pos = sub->value_start = _DBUS_ALIGN_VALUE (sub->value_pos, 8);
+  }
 }
 
 static void
@@ -219,6 +251,9 @@ array_reader_get_array_len (const DBusTypeReader *reader)
   dbus_uint32_t array_len;
   int len_pos;
 
+  if (reader->gvariant)
+    return reader->value_end - reader->value_start;
+
   len_pos = ARRAY_READER_LEN_POS (reader);
 
   _dbus_assert (_DBUS_ALIGN_VALUE (len_pos, 4) == (unsigned) len_pos);
@@ -244,20 +279,38 @@ array_reader_recurse (DBusTypeReader *sub,
 
   array_types_only_reader_recurse (sub, parent);
 
-  sub->value_pos = _DBUS_ALIGN_VALUE (sub->value_pos, 4);
+  if (sub->gvariant)
+  {
+    int size = _dbus_reader_get_type_fixed_size (sub, &alignment);
+    sub->value_pos = _DBUS_ALIGN_VALUE (sub->value_pos, alignment);
+    sub->value_start = sub->value_pos;
+    sub->offsets_from_back = FALSE;
+    sub->value_end = _dbus_reader_get_offset_of_end_of_variable (parent);
+    sub->variable_index = 0;
+    if (0 == size)
+      sub->n_offsets = _dbus_reader_count_array_elems (sub);
+    else
+      sub->n_offsets = 0;
+    sub->u.array.start_pos = sub->value_start;
+    sub->finished = (sub->value_end == sub->value_start);
+  }
+  else
+  {
+    sub->value_pos = _DBUS_ALIGN_VALUE (sub->value_pos, 4);
 
-  len_pos = sub->value_pos;
+    len_pos = sub->value_pos;
 
-  sub->value_pos += 4; /* for the length */
+    sub->value_pos += 4; /* for the length */
 
-  alignment = element_type_get_alignment (sub->type_str,
-                                          sub->type_pos);
+    alignment = element_type_get_alignment (sub->type_str,
+                                            sub->type_pos);
 
-  sub->value_pos = _DBUS_ALIGN_VALUE (sub->value_pos, alignment);
+    sub->value_pos = _DBUS_ALIGN_VALUE (sub->value_pos, alignment);
 
-  sub->u.array.start_pos = sub->value_pos;
-  _dbus_assert ((sub->u.array.start_pos - (len_pos + 4)) < 8); /* only 3 bits in array_len_offset */
-  sub->array_len_offset = sub->u.array.start_pos - (len_pos + 4);
+    sub->u.array.start_pos = sub->value_pos;
+    _dbus_assert ((sub->u.array.start_pos - (len_pos + 4)) < 8); /* only 3 bits in array_len_offset */
+    sub->array_len_offset = sub->u.array.start_pos - (len_pos + 4);
+  }
 
 #if RECURSIVE_MARSHAL_READ_TRACE
   _dbus_verbose ("    type reader %p array start = %d len_offset = %d array len = %d array element type = %s\n",
@@ -279,21 +332,46 @@ variant_reader_recurse (DBusTypeReader *sub,
 
   base_reader_recurse (sub, parent);
 
-  /* Variant is 1 byte sig length (without nul), signature with nul,
-   * padding to 8-boundary, then values
-   */
+  if (sub->gvariant)
+  {
+    /* GVariant's Variant is values, then nul byte, then signature.
+     * Variant's alignment is 8.
+     */
+    sub->value_pos = sub->value_start = _DBUS_ALIGN_VALUE (sub->value_pos, 8); /* adjust alignment */
+    sub->value_end = _dbus_reader_get_offset_of_end_of_variable (parent);
 
-  sig_len = _dbus_string_get_byte (sub->value_str, sub->value_pos);
+    /* find beginning of signature in variant */
+    sub->type_str = sub->value_str;
+    sub->type_pos = sub->value_end - 1;
 
-  sub->type_str = sub->value_str;
-  sub->type_pos = sub->value_pos + 1;
+    while (sub->type_pos > 0 && _dbus_string_get_byte (sub->type_str, sub->type_pos) != 0)
+      sub->type_pos--;
 
-  sub->value_pos = sub->type_pos + sig_len + 1;
+    if (_dbus_string_get_byte (sub->type_str, sub->type_pos) == 0)
+      sub->type_pos++;
 
-  contained_alignment = _dbus_type_get_alignment (_dbus_first_type_in_signature (sub->type_str,
-                                                                           sub->type_pos));
-  
-  sub->value_pos = _DBUS_ALIGN_VALUE (sub->value_pos, contained_alignment);
+    /* set the end of variant's value to the zero byte before signature */
+    sub->value_end = sub->type_pos - 1;
+    sub->is_variant = TRUE;
+  }
+  else
+  {
+    /* Variant is 1 byte sig length (without nul), signature with nul,
+     * padding to 8-boundary, then values
+     */
+
+    sig_len = _dbus_string_get_byte (sub->value_str, sub->value_pos);
+
+    sub->type_str = sub->value_str;
+    sub->type_pos = sub->value_pos + 1;
+
+    sub->value_pos = sub->type_pos + sig_len + 1;
+
+    contained_alignment = _dbus_type_get_alignment (_dbus_first_type_in_signature (sub->type_str,
+                                                                             sub->type_pos));
+
+    sub->value_pos = _DBUS_ALIGN_VALUE (sub->value_pos, contained_alignment);
+  }
 
 #if RECURSIVE_MARSHAL_READ_TRACE
   _dbus_verbose ("    type reader %p variant containing '%s'\n",
@@ -338,7 +416,7 @@ skip_one_complete_type (const DBusString *type_str,
  */
 void
 _dbus_type_signature_next (const char       *type_str,
-			   int              *type_pos)
+                           int              *type_pos)
 {
   const unsigned char *p;
   const unsigned char *start;
@@ -443,6 +521,7 @@ base_reader_next (DBusTypeReader *reader,
     case DBUS_TYPE_STRUCT:
     case DBUS_TYPE_VARIANT:
       /* Scan forward over the entire container contents */
+      /* FIXME for GVariant - use offsets */
       {
         DBusTypeReader sub;
 
@@ -489,7 +568,8 @@ base_reader_next (DBusTypeReader *reader,
 
     default:
       if (!reader->klass->types_only)
-        _dbus_marshal_skip_basic (reader->value_str,
+        (reader->gvariant ? _dbus_marshal_skip_gvariant_basic : _dbus_marshal_skip_basic) (
+                                  reader->value_str,
                                   current_type, reader->byte_order,
                                   &reader->value_pos);
 
@@ -499,12 +579,40 @@ base_reader_next (DBusTypeReader *reader,
 }
 
 static void
+struct_or_dict_entry_reader_next (DBusTypeReader *reader,
+                            int             current_type)
+{
+  if (reader->gvariant)
+    {
+      int alignment;
+      int size = _dbus_reader_get_type_fixed_size (reader, &alignment);
+      if (0 == size)
+        {
+          /* variable size - use offsets*/
+          reader->value_pos = _dbus_reader_get_offset_of_end_of_variable (reader);
+          reader->variable_index++;
+        }
+      else
+        {
+          /* just move, but consider alignment */
+          reader->value_pos = _DBUS_ALIGN_VALUE(reader->value_pos, alignment) + size;
+        }
+
+      skip_one_complete_type (reader->type_str, &reader->type_pos);
+    }
+  else
+    {
+      base_reader_next (reader, current_type);
+    }
+}
+
+static void
 struct_reader_next (DBusTypeReader *reader,
                     int             current_type)
 {
   int t;
 
-  base_reader_next (reader, current_type);
+  struct_or_dict_entry_reader_next (reader, current_type);
 
   /* for STRUCT containers we return FALSE at the end of the struct,
    * for INVALID we return FALSE at the end of the signature.
@@ -520,12 +628,22 @@ struct_reader_next (DBusTypeReader *reader,
 }
 
 static void
+body_reader_next (DBusTypeReader *reader,
+                  int             current_type)
+{
+  if (reader->gvariant)
+    struct_reader_next (reader, current_type);
+  else
+    base_reader_next (reader, current_type);
+}
+
+static void
 dict_entry_reader_next (DBusTypeReader *reader,
                         int             current_type)
 {
   int t;
 
-  base_reader_next (reader, current_type);
+  struct_or_dict_entry_reader_next (reader, current_type);
 
   /* for STRUCT containers we return FALSE at the end of the struct,
    * for INVALID we return FALSE at the end of the signature.
@@ -558,6 +676,26 @@ array_reader_next (DBusTypeReader *reader,
 {
   /* Skip one array element */
   int end_pos;
+
+  if (reader->gvariant)
+    {
+      int alignment;
+      int size = _dbus_reader_get_type_fixed_size (reader, &alignment);
+      if (0 == size)
+        {
+          /* variable size - use offsets*/
+          reader->value_pos = _dbus_reader_get_offset_of_end_of_variable (reader);
+          reader->variable_index++;
+          reader->finished = (reader->variable_index >= reader->n_offsets);
+        }
+      else
+        {
+          /* fixed size - move on; consider alignment */
+          reader->value_pos = _DBUS_ALIGN_VALUE(reader->value_pos, alignment) + size;
+          reader->finished = (reader->value_pos >= reader->value_end);
+        }
+      return;
+    }
 
   end_pos = reader->u.array.start_pos + array_reader_get_array_len (reader);
 
@@ -631,12 +769,33 @@ array_reader_next (DBusTypeReader *reader,
     }
 }
 
+static void
+variant_reader_next (DBusTypeReader *reader,
+                     int             current_type)
+{
+  if (reader->gvariant)
+    {
+      if (!reader->klass->types_only)
+        reader->value_pos = reader->value_end;
+
+      reader->type_pos += 1;
+
+      reader->finished = TRUE;
+
+      reader->variable_index++;
+    }
+  else
+    {
+      base_reader_next (reader, current_type);
+    }
+}
+
 static const DBusTypeReaderClass body_reader_class = {
   "body", 0,
   FALSE,
   NULL, /* body is always toplevel, so doesn't get recursed into */
   NULL,
-  base_reader_next
+  body_reader_next
 };
 
 static const DBusTypeReaderClass body_types_only_reader_class = {
@@ -644,7 +803,7 @@ static const DBusTypeReaderClass body_types_only_reader_class = {
   TRUE,
   NULL, /* body is always toplevel, so doesn't get recursed into */
   NULL,
-  base_reader_next
+  body_reader_next
 };
 
 static const DBusTypeReaderClass struct_reader_class = {
@@ -700,7 +859,7 @@ static const DBusTypeReaderClass variant_reader_class = {
   FALSE,
   variant_reader_recurse,
   NULL,
-  base_reader_next
+  variant_reader_next
 };
 
 #ifndef DBUS_DISABLE_ASSERT
@@ -739,7 +898,7 @@ _dbus_type_reader_init (DBusTypeReader    *reader,
   reader->klass = &body_reader_class;
 
   reader_init (reader, byte_order, type_str, type_pos,
-               value_str, value_pos);
+               value_str, value_pos, FALSE);
 
 #if RECURSIVE_MARSHAL_READ_TRACE
   _dbus_verbose ("  type reader %p init type_pos = %d value_pos = %d remaining sig '%s'\n",
@@ -764,7 +923,8 @@ _dbus_type_reader_init_types_only (DBusTypeReader    *reader,
   reader->klass = &body_types_only_reader_class;
 
   reader_init (reader, DBUS_COMPILER_BYTE_ORDER /* irrelevant */,
-               type_str, type_pos, NULL, _DBUS_INT_MAX /* crashes if we screw up */);
+               type_str, type_pos, NULL, _DBUS_INT_MAX /* crashes if we screw up */,
+               FALSE);
 
 #if RECURSIVE_MARSHAL_READ_TRACE
   _dbus_verbose ("  type reader %p init types only type_pos = %d remaining sig '%s'\n",
@@ -875,7 +1035,8 @@ _dbus_type_reader_read_basic (const DBusTypeReader    *reader,
 
   t = _dbus_type_reader_get_current_type (reader);
 
-  _dbus_marshal_read_basic (reader->value_str,
+  (reader->gvariant ? _dbus_marshal_read_gvariant_basic : _dbus_marshal_read_basic) (
+                            reader->value_str,
                             reader->value_pos,
                             t, value,
                             reader->byte_order,
@@ -1499,9 +1660,14 @@ _dbus_type_writer_init (DBusTypeWriter *writer,
   writer->type_pos = type_pos;
   writer->value_str = value_str;
   writer->value_pos = value_pos;
+  writer->value_start = value_pos;
   writer->container_type = DBUS_TYPE_INVALID;
   writer->type_pos_is_expectation = FALSE;
   writer->enabled = TRUE;
+  writer->gvariant = FALSE;
+  writer->body_container = FALSE;
+  writer->is_fixed = TRUE;
+  writer->alignment = 1;
 
 #if RECURSIVE_MARSHAL_WRITE_TRACE
   _dbus_verbose ("writer %p init remaining sig '%s'\n", writer,
@@ -1529,6 +1695,24 @@ _dbus_type_writer_init_types_delayed (DBusTypeWriter *writer,
 {
   _dbus_type_writer_init (writer, byte_order,
                           NULL, 0, value_str, value_pos);
+}
+
+void
+_dbus_type_writer_gvariant_init_types_delayed (DBusTypeWriter *writer,
+                                      int             byte_order,
+                                      DBusString     *value_str,
+                                      int             value_pos,
+                                      dbus_bool_t     gvariant)
+{
+  _dbus_type_writer_init (writer, byte_order,
+                          NULL, 0, value_str, value_pos);
+  writer->gvariant = gvariant;
+  writer->body_container = TRUE;
+  writer->is_fixed = TRUE;
+  writer->alignment = 8;
+  writer->u.struct_or_dict.last_offset = 0;
+  writer->offsets_size = 1;
+  writer->offsets = NULL;
 }
 
 /**
@@ -1598,12 +1782,19 @@ _dbus_type_writer_write_basic_no_typecode (DBusTypeWriter *writer,
                                            const void     *value)
 {
   if (writer->enabled)
-    return _dbus_marshal_write_basic (writer->value_str,
-                                      writer->value_pos,
-                                      type,
-                                      value,
-                                      writer->byte_order,
-                                      &writer->value_pos);
+    {
+      if (writer->gvariant)
+        {
+          return _dbus_type_writer_gvariant_write_basic_no_typecode (writer, type, value);
+        }
+      else
+        return _dbus_marshal_write_basic (writer->value_str,
+                                          writer->value_pos,
+                                          type,
+                                          value,
+                                          writer->byte_order,
+                                          &writer->value_pos);
+    }
   else
     return TRUE;
 }
@@ -1642,6 +1833,7 @@ writer_recurse_init_and_check (DBusTypeWriter *writer,
                           writer->value_pos);
 
   sub->container_type = container_type;
+  sub->gvariant = writer->gvariant;
 
   if (writer->type_pos_is_expectation ||
       (sub->container_type == DBUS_TYPE_ARRAY || sub->container_type == DBUS_TYPE_VARIANT))
@@ -1792,12 +1984,28 @@ writer_recurse_struct_or_dict_entry (DBusTypeWriter   *writer,
 
   if (writer->enabled)
     {
-      if (!_dbus_string_insert_bytes (sub->value_str,
-                                      sub->value_pos,
-                                      _DBUS_ALIGN_VALUE (sub->value_pos, 8) - sub->value_pos,
-                                      '\0'))
-        _dbus_assert_not_reached ("should not have failed to insert alignment padding for struct");
-      sub->value_pos = _DBUS_ALIGN_VALUE (sub->value_pos, 8);
+      if (writer->gvariant)
+        {
+          sub->alignment = 1;
+          sub->value_str = dbus_new (DBusString, 1);
+          if (NULL == sub->value_str || !_dbus_string_init (sub->value_str))
+            return FALSE;
+          sub->value_start = sub->value_pos = 0;
+          sub->u.struct_or_dict.last_offset = 0;
+          sub->offsets_size = 1;
+          sub->is_fixed = TRUE;
+          sub->offsets = dbus_new (DBusString, 1);
+          _dbus_string_init (sub->offsets);
+        }
+      else
+        {
+          if (!_dbus_string_insert_bytes (sub->value_str,
+                                          sub->value_pos,
+                                          _DBUS_ALIGN_VALUE (sub->value_pos, 8) - sub->value_pos,
+                                          '\0'))
+          _dbus_assert_not_reached ("should not have failed to insert alignment padding for struct");
+          sub->value_pos =  _DBUS_ALIGN_VALUE (sub->value_pos, 8);
+        }
     }
 
   return TRUE;
@@ -1885,27 +2093,47 @@ writer_recurse_array (DBusTypeWriter   *writer,
 
   if (writer->enabled)
     {
-      /* Write (or jump over, if is_array_append) the length */
-      sub->u.array.len_pos = _DBUS_ALIGN_VALUE (sub->value_pos, 4);
-
-      if (is_array_append)
+      if (!writer->gvariant)
         {
-          sub->value_pos += 4;
-        }
-      else
-        {
-          if (!_dbus_type_writer_write_basic_no_typecode (sub, DBUS_TYPE_UINT32,
-                                                          &value))
-            _dbus_assert_not_reached ("should not have failed to insert array len");
-        }
+          /* Write (or jump over, if is_array_append) the length */
+          sub->u.array.len_pos = _DBUS_ALIGN_VALUE (sub->value_pos, 4);
 
-      _dbus_assert (sub->u.array.len_pos == sub->value_pos - 4);
+          if (is_array_append)
+          {
+            sub->value_pos += 4;
+          }
+          else
+          {
+            if (!_dbus_type_writer_write_basic_no_typecode (sub, DBUS_TYPE_UINT32, &value))
+              _dbus_assert_not_reached ("should not have failed to insert array len");
+          }
+
+          _dbus_assert (sub->u.array.len_pos == sub->value_pos - 4);
+        }
 
       /* Write alignment padding for array elements
        * Note that we write the padding *even for empty arrays*
        * to avoid wonky special cases
        */
-      alignment = element_type_get_alignment (contained_type, contained_type_start);
+      if (writer->gvariant)
+        {
+          int size = _dbus_type_gvariant_get_fixed_size (contained_type, contained_type_start, &alignment);
+          if (0 == size)
+            {
+              sub->offsets_size = 1;
+              sub->offsets = dbus_new (DBusString, 1);
+              _dbus_string_init (sub->offsets);
+            }
+          else
+            {
+              sub->offsets_size = 0;
+              sub->offsets = NULL;
+            }
+        }
+      else
+      {
+        alignment = element_type_get_alignment (contained_type, contained_type_start);
+      }
 
       aligned = _DBUS_ALIGN_VALUE (sub->value_pos, alignment);
       if (aligned != sub->value_pos)
@@ -1924,7 +2152,7 @@ writer_recurse_array (DBusTypeWriter   *writer,
 
       sub->u.array.start_pos = sub->value_pos;
 
-      if (is_array_append)
+      if (is_array_append && !writer->gvariant)
         {
           dbus_uint32_t len;
 
@@ -1937,6 +2165,12 @@ writer_recurse_array (DBusTypeWriter   *writer,
 
           sub->value_pos += len;
         }
+      if (writer->gvariant)
+        {
+          sub->alignment = alignment;
+          sub->is_fixed = FALSE;
+          sub->value_start = sub->value_pos;
+        }
     }
   else
     {
@@ -1945,7 +2179,7 @@ writer_recurse_array (DBusTypeWriter   *writer,
       sub->u.array.start_pos = sub->value_pos;
     }
 
-  _dbus_assert (sub->u.array.len_pos < sub->u.array.start_pos);
+  _dbus_assert (sub->gvariant || sub->u.array.len_pos < sub->u.array.start_pos);
   _dbus_assert (is_array_append || sub->u.array.start_pos == sub->value_pos);
 
 #if RECURSIVE_MARSHAL_WRITE_TRACE
@@ -2012,31 +2246,58 @@ writer_recurse_variant (DBusTypeWriter   *writer,
 
   /* If we're enabled then continue ... */
 
-  if (!_dbus_string_insert_byte (sub->value_str,
-                                 sub->value_pos,
-                                 contained_type_len))
-    _dbus_assert_not_reached ("should not have failed to insert variant type sig len");
+  if (writer->gvariant)
+    {
+      /* GVariant case:
+       * contents, then nul byte, then signature without nul byte.
+       * The alignment is always 8.
+       *
+       * Signature is at the end of a variant. So, the easiest way is to write it down
+       * when unrecursing. So, we need to copy it to a new string.
+       */
+      contained_alignment = 8;
+      sub->alignment = 8;
+      sub->type_str = dbus_new (DBusString, 1); /* to be deallocated on unrecurse */
+      sub->type_pos = 0;
+      sub->is_fixed = FALSE;
+      _dbus_string_init_preallocated (sub->type_str, contained_type_len);
 
-  sub->value_pos += 1;
+      if (!_dbus_string_copy_len (contained_type, contained_type_start, contained_type_len,
+                                  sub->type_str, sub->type_pos))
+        _dbus_assert_not_reached ("should not have failed to insert variant type sig");
+    }
+  else
+    {
+      /* dbus1 case:
+       * length, signature with nul byte, then contents
+       * alignment depends on contents.
+       */
+      if (!_dbus_string_insert_byte (sub->value_str,
+                                     sub->value_pos,
+                                     contained_type_len))
+        _dbus_assert_not_reached ("should not have failed to insert variant type sig len");
 
-  /* Here we switch over to the expected type sig we're about to write */
-  sub->type_str = sub->value_str;
-  sub->type_pos = sub->value_pos;
+      sub->value_pos += 1;
 
-  if (!_dbus_string_copy_len (contained_type, contained_type_start, contained_type_len,
-                              sub->value_str, sub->value_pos))
-    _dbus_assert_not_reached ("should not have failed to insert variant type sig");
+      /* Here we switch over to the expected type sig we're about to write */
+      sub->type_str = sub->value_str;
+      sub->type_pos = sub->value_pos;
 
-  sub->value_pos += contained_type_len;
+      if (!_dbus_string_copy_len (contained_type, contained_type_start, contained_type_len,
+                                  sub->value_str, sub->value_pos))
+        _dbus_assert_not_reached ("should not have failed to insert variant type sig");
 
-  if (!_dbus_string_insert_byte (sub->value_str,
-                                 sub->value_pos,
-                                 DBUS_TYPE_INVALID))
-    _dbus_assert_not_reached ("should not have failed to insert variant type nul termination");
+      sub->value_pos += contained_type_len;
 
-  sub->value_pos += 1;
+      if (!_dbus_string_insert_byte (sub->value_str,
+                                     sub->value_pos,
+                                     DBUS_TYPE_INVALID))
+        _dbus_assert_not_reached ("should not have failed to insert variant type nul termination");
 
-  contained_alignment = _dbus_type_get_alignment (_dbus_first_type_in_signature (contained_type, contained_type_start));
+      sub->value_pos += 1;
+
+      contained_alignment = _dbus_type_get_alignment (_dbus_first_type_in_signature (contained_type, contained_type_start));
+    }
   
   if (!_dbus_string_insert_bytes (sub->value_str,
                                   sub->value_pos,
@@ -2044,6 +2305,7 @@ writer_recurse_variant (DBusTypeWriter   *writer,
                                   '\0'))
     _dbus_assert_not_reached ("should not have failed to insert alignment padding for variant body");
   sub->value_pos = _DBUS_ALIGN_VALUE (sub->value_pos, contained_alignment);
+  sub->value_start = sub->value_pos;
 
   return TRUE;
 }
@@ -2116,6 +2378,8 @@ _dbus_type_writer_recurse (DBusTypeWriter   *writer,
   else
     contained_type_len = 0;
 
+  sub->body_container = FALSE;
+
   return _dbus_type_writer_recurse_contained_len (writer, container_type,
                                                   contained_type,
                                                   contained_type_start,
@@ -2164,6 +2428,47 @@ writer_get_array_len (DBusTypeWriter *writer)
   return writer->value_pos - writer->u.array.start_pos;
 }
 
+static dbus_bool_t
+_dbus_type_writer_unrecurse_write (DBusTypeWriter *writer,
+                                   DBusTypeWriter *sub)
+{
+  if (sub->container_type == DBUS_TYPE_STRUCT)
+    {
+      if (!write_or_verify_typecode (sub, DBUS_STRUCT_END_CHAR))
+        return FALSE;
+    }
+  else if (sub->container_type == DBUS_TYPE_DICT_ENTRY)
+    {
+      if (!write_or_verify_typecode (sub, DBUS_DICT_ENTRY_END_CHAR))
+        return FALSE;
+    }
+  else if (sub->container_type == DBUS_TYPE_ARRAY && !sub->gvariant)
+    {
+      if (sub->u.array.len_pos >= 0) /* len_pos == -1 if we weren't enabled when we passed it */
+        {
+          dbus_uint32_t len;
+
+          /* Set the array length */
+          len = writer_get_array_len (sub);
+          _dbus_marshal_set_uint32 (sub->value_str,
+                                    sub->u.array.len_pos,
+                                    len,
+                                    sub->byte_order);
+#if RECURSIVE_MARSHAL_WRITE_TRACE
+          _dbus_verbose ("    filled in sub array len to %u at len_pos %d\n",
+                         len, sub->u.array.len_pos);
+#endif
+        }
+#if RECURSIVE_MARSHAL_WRITE_TRACE
+      else
+        {
+          _dbus_verbose ("    not filling in sub array len because we were disabled when we passed the len\n");
+        }
+#endif
+    }
+  return TRUE;
+}
+
 /**
  * Closes a container created by _dbus_type_writer_recurse()
  * and writes any additional information to the values block.
@@ -2190,40 +2495,17 @@ _dbus_type_writer_unrecurse (DBusTypeWriter *writer,
                  _dbus_type_to_string (sub->container_type));
 #endif
 
-  if (sub->container_type == DBUS_TYPE_STRUCT)
-    {
-      if (!write_or_verify_typecode (sub, DBUS_STRUCT_END_CHAR))
-        return FALSE;
-    }
-  else if (sub->container_type == DBUS_TYPE_DICT_ENTRY)
-    {
-      if (!write_or_verify_typecode (sub, DBUS_DICT_ENTRY_END_CHAR))
-        return FALSE;
-    }
-  else if (sub->container_type == DBUS_TYPE_ARRAY)
-    {
-      if (sub->u.array.len_pos >= 0) /* len_pos == -1 if we weren't enabled when we passed it */
-        {
-          dbus_uint32_t len;
+  if (!_dbus_type_writer_unrecurse_write (writer, sub))
+    return FALSE;
 
-          /* Set the array length */
-          len = writer_get_array_len (sub);
-          _dbus_marshal_set_uint32 (sub->value_str,
-                                    sub->u.array.len_pos,
-                                    len,
-                                    sub->byte_order);
-#if RECURSIVE_MARSHAL_WRITE_TRACE
-          _dbus_verbose ("    filled in sub array len to %u at len_pos %d\n",
-                         len, sub->u.array.len_pos);
-#endif
-        }
-#if RECURSIVE_MARSHAL_WRITE_TRACE
-      else
-        {
-          _dbus_verbose ("    not filling in sub array len because we were disabled when we passed the len\n");
-        }
-#endif
+  if (writer->gvariant)
+    {
+      if (!_dbus_writer_unrecurse_gvariant_write (writer, sub))
+        return FALSE;
     }
+  else
+    writer->value_pos = sub->value_pos;
+
 
   /* Now get type_pos right for the parent writer. Here are the cases:
    *
@@ -2282,8 +2564,6 @@ _dbus_type_writer_unrecurse (DBusTypeWriter *writer,
           writer->type_pos = sub->type_pos;
         }
     }
-
-  writer->value_pos = sub->value_pos;
 
 #if RECURSIVE_MARSHAL_WRITE_TRACE
   _dbus_verbose ("  type writer %p unrecursed type_pos = %d value_pos = %d remaining sig '%s'\n",
